@@ -1,36 +1,12 @@
 services:
 
-  browserless:
-    image: browserless/chrome:latest
+  browser:
+    image: agent-desk:latest
     container_name: cloud-browser
     restart: unless-stopped
     ports:
-      - "3000:3000" # CDP endpoint
-    environment:
-      - MAX_CONCURRENT_SESSIONS=10
-      - CONNECTION_TIMEOUT=600000
-      - ENABLE_DEBUGGER=true
-      - DEFAULT_BLOCK_ADS=true
-      - DEFAULT_STEALTH=true
+      - "9230:9222" # CDP for agent (Playwright / Puppeteer / browser-use)
+      - "6080:6080" # noVNC for user viewing
     shm_size: "2gb"
-
-  xvfb:
-    image: dorowu/ubuntu-desktop-lxde-vnc
-    container_name: browser-desktop
-    restart: unless-stopped
-    ports:
-      - "6080:80" # noVNC web
-      - "5900:5900" # VNC
-      - "6079:6079" # VNC
     environment:
-      - RESOLUTION=1280x800
-      - VNC_PASSWORD=agentbrowser
-
-  nginx:
-    image: nginx:stable
-    container_name: browser-gateway
-    restart: unless-stopped
-    ports:
-      - "8080:80"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - RESOLUTION=1280x800x24
