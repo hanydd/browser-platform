@@ -5,7 +5,7 @@ ENV DISPLAY=:99
 ENV RESOLUTION=1280x800x24
 ENV CHROME_PROFILE_DIR=/tmp/chrome-data
 
-RUN sed -i 's@deb.debian.org@mirrors.tuna.tsinghua.edu.cn@g' /etc/apt/sources.list.d/debian.sources
+RUN sed -i 's@deb.debian.org@mirrors.aliyun.com@g' /etc/apt/sources.list.d/debian.sources
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     socat \

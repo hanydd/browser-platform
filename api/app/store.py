@@ -58,6 +58,8 @@ class RedisStore:
     async def list_pool_containers(self) -> list[PoolContainerRecord]:
         items: list[PoolContainerRecord] = []
         async for key in self.redis.scan_iter(match="pool:*"):
+            if key == "pool:idle":
+                continue  # pool:idle is a SET, not a string
             if key.startswith("pool:") and key.count(":") == 1:
                 raw = await self.redis.get(key)
                 if raw:
@@ -85,6 +87,8 @@ class RedisStore:
     async def total_pool_count(self) -> int:
         count = 0
         async for key in self.redis.scan_iter(match="pool:*"):
+            if key == "pool:idle":
+                continue
             if key.startswith("pool:") and key.count(":") == 1:
                 count += 1
         return count

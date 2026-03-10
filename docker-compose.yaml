@@ -2,7 +2,7 @@ services:
   browser-image:
     image: agent-desk:latest
     build:
-      context: .
+      context: ./browser
       dockerfile: Dockerfile
     profiles: ["build-only"]
 
