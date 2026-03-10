@@ -1,12 +1,116 @@
 services:
-
-  browser:
+  browser-image:
     image: agent-desk:latest
-    container_name: cloud-browser
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles: ["build-only"]
+
+  redis:
+    image: redis:7-alpine
+    container_name: browser-platform-redis
     restart: unless-stopped
-    ports:
-      - "9230:9222" # CDP for agent (Playwright / Puppeteer / browser-use)
-      - "6080:6080" # noVNC for user viewing
-    shm_size: "2gb"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    networks:
+      - browser-platform
+    mem_limit: 512m
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  api:
+    image: browser-platform-api:latest
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: browser-platform-api
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
     environment:
-      - RESOLUTION=1280x800x24
+      API_KEY: change-me
+      REDIS_URL: redis://redis:6379/0
+      BROWSER_IMAGE: agent-desk:latest
+      DOCKER_NETWORK: browser-platform
+      BROWSER_RESOLUTION: 1280x800x24
+      BROWSER_PROFILE_DIR: /tmp/chrome-data
+      BROWSER_MEM_LIMIT: 2g
+      BROWSER_NANO_CPUS: 2000000000
+      BROWSER_SHM_SIZE: 2g
+      POOL_MIN_SIZE: 2
+      POOL_MAX_SIZE: 10
+      DEFAULT_TTL_SECONDS: 1800
+      HOUSEKEEPING_INTERVAL_SECONDS: 15
+      PROFILE_ARCHIVE_DIR: /data/profiles
+      LOG_LEVEL: INFO
+      LOG_JSON: "true"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - profile-archives:/data/profiles
+    networks:
+      - browser-platform
+    mem_limit: 1g
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.browser-platform.rule=PathPrefix(`/`)
+      - traefik.http.routers.browser-platform.entrypoints=web
+      - traefik.http.services.browser-platform.loadbalancer.server.port=8000
+      - traefik.http.middlewares.browser-platform-headers.headers.customrequestheaders.X-Forwarded-Proto=http
+      - traefik.http.routers.browser-platform.middlewares=browser-platform-headers
+
+  traefik:
+    image: traefik:v3.1
+    container_name: browser-platform-traefik
+    restart: unless-stopped
+    command:
+      - --ping=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --log.level=INFO
+    ports:
+      - "8080:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - browser-platform
+    mem_limit: 256m
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+networks:
+  browser-platform:
+    name: browser-platform
+    driver: bridge
+
+volumes:
+  redis-data:
+  profile-archives:
