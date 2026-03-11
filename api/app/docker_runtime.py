@@ -135,11 +135,78 @@ class DockerRuntime:
 
     def _save_profile_sync(self, container_name: str, archive_path: Path) -> None:
         container = self.client.containers.get(container_name)
-        bits, _ = container.get_archive(self.settings.browser_profile_dir)
+        profile_dir = PurePosixPath(self.settings.browser_profile_dir)
+        target_dir = str(profile_dir.parent)
+        profile_name = profile_dir.name
+        logger.info(
+            "save_profile_started",
+            extra={
+                "container_name": container_name,
+                "archive_path": str(archive_path),
+                "profile_dir": self.settings.browser_profile_dir,
+                "tar_workdir": target_dir,
+            },
+        )
+        exec_id = self.client.api.exec_create(
+            container.id,
+            ["tar", "-cf", "-", "-C", target_dir, profile_name],
+        )["Id"]
+        exec_socket = self.client.api.exec_start(exec_id, socket=True)
+        raw_socket = getattr(exec_socket, "_sock", exec_socket)
         archive_path.parent.mkdir(parents=True, exist_ok=True)
-        with archive_path.open("wb") as file_handle:
-            for chunk in bits:
-                file_handle.write(chunk)
+        total_bytes = 0
+        stderr_chunks: list[bytes] = []
+        buffer = b""
+        try:
+            with archive_path.open("wb") as file_handle:
+                while True:
+                    chunk = raw_socket.recv(65536)
+                    if not chunk:
+                        break
+                    buffer += chunk
+                    while len(buffer) >= 8:
+                        stream_type = buffer[0]
+                        payload_size = int.from_bytes(buffer[4:8], "big")
+                        frame_size = 8 + payload_size
+                        if len(buffer) < frame_size:
+                            break
+                        payload = buffer[8:frame_size]
+                        buffer = buffer[frame_size:]
+                        if stream_type == 1:
+                            file_handle.write(payload)
+                            total_bytes += len(payload)
+                        elif stream_type in {2, 3}:
+                            stderr_chunks.append(payload)
+        finally:
+            exec_socket.close()
+        result = self.client.api.exec_inspect(exec_id)
+        stderr_output = b"".join(stderr_chunks).decode("utf-8", errors="ignore").strip()
+        logger.info(
+            "save_profile_finished",
+            extra={
+                "container_name": container_name,
+                "archive_path": str(archive_path),
+                "profile_dir": self.settings.browser_profile_dir,
+                "exit_code": result["ExitCode"],
+                "bytes_written": total_bytes,
+                "archive_exists": archive_path.exists(),
+                "stderr_output": stderr_output,
+            },
+        )
+        if result["ExitCode"] != 0:
+            logger.error(
+                "save_profile_failed",
+                extra={
+                    "container_name": container_name,
+                    "archive_path": str(archive_path),
+                    "profile_dir": self.settings.browser_profile_dir,
+                    "exit_code": result["ExitCode"],
+                    "bytes_written": total_bytes,
+                    "stderr_output": stderr_output,
+                },
+            )
+            archive_path.unlink(missing_ok=True)
+            raise RuntimeError(f"failed to save profile archive for {container_name}")
 
     async def restore_profile(self, container_name: str, archive_path: Path) -> None:
         if not archive_path.exists():

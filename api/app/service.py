@@ -175,18 +175,44 @@ class SessionService:
     async def _release_session(self, session: SessionRecord) -> None:
         session.status = "releasing"
         await self.store.save_session(session)
+        archive_path = self.profile_archive_path(session.user_id)
 
         cleanup_failed = False
         try:
             await self.runtime.stop_browser(session.container_name)
             if session.persist_profile:
-                await self.runtime.save_profile(session.container_name, self.profile_archive_path(session.user_id))
+                logger.info(
+                    "session_profile_persist_started",
+                    extra={
+                        "session_id": session.session_id,
+                        "user_id": session.user_id,
+                        "container_name": session.container_name,
+                        "archive_path": str(archive_path),
+                    },
+                )
+                await self.runtime.save_profile(session.container_name, archive_path)
+                logger.info(
+                    "session_profile_persist_finished",
+                    extra={
+                        "session_id": session.session_id,
+                        "user_id": session.user_id,
+                        "container_name": session.container_name,
+                        "archive_path": str(archive_path),
+                        "archive_exists": archive_path.exists(),
+                        "archive_size": archive_path.stat().st_size if archive_path.exists() else 0,
+                    },
+                )
             await self.runtime.reset_profile(session.container_name)
         except Exception:
             cleanup_failed = True
             logger.exception(
                 "session_release_cleanup_failed",
-                extra={"session_id": session.session_id, "container_name": session.container_name},
+                extra={
+                    "session_id": session.session_id,
+                    "user_id": session.user_id,
+                    "container_name": session.container_name,
+                    "archive_path": str(archive_path),
+                },
             )
 
         await self.store.delete_session(session.session_id, session.user_id)
