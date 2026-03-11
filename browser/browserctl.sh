@@ -7,10 +7,31 @@ PUBLIC_PORT="${CHROME_PUBLIC_PORT:-9222}"
 CHROME_PID_FILE="/var/run/chromium.pid"
 SOCAT_PID_FILE="/var/run/socat-cdp.pid"
 
+log() {
+  printf '%s\n' "$1" >&2
+}
+
+is_running_from_pid_file() {
+  pid_file="$1"
+  [ -f "$pid_file" ] && kill -0 "$(cat "$pid_file")" 2>/dev/null
+}
+
+wait_for_cdp() {
+  attempts=20
+  while [ "$attempts" -gt 0 ]; do
+    if curl -fsS "http://127.0.0.1:${PUBLIC_PORT}/json/version" >/dev/null 2>&1; then
+      return 0
+    fi
+    attempts=$((attempts - 1))
+    sleep 1
+  done
+  return 1
+}
+
 start_chrome() {
   mkdir -p "$PROFILE_DIR"
-  if [ -f "$CHROME_PID_FILE" ] && kill -0 "$(cat "$CHROME_PID_FILE")" 2>/dev/null; then
-    echo "chromium already running"
+  if is_running_from_pid_file "$CHROME_PID_FILE"; then
+    log "chromium already running"
     exit 0
   fi
 
@@ -33,6 +54,12 @@ start_chrome() {
   socat TCP-LISTEN:${PUBLIC_PORT},fork,reuseaddr,bind=0.0.0.0 TCP:127.0.0.1:${CHROME_PORT} \
     >/proc/1/fd/1 2>/proc/1/fd/2 &
   echo "$!" > "$SOCAT_PID_FILE"
+
+  if ! wait_for_cdp; then
+    log "cdp endpoint did not become ready in time"
+    stop_chrome
+    exit 1
+  fi
 }
 
 stop_process() {
@@ -54,7 +81,7 @@ stop_chrome() {
 }
 
 status_chrome() {
-  if [ -f "$CHROME_PID_FILE" ] && kill -0 "$(cat "$CHROME_PID_FILE")" 2>/dev/null; then
+  if is_running_from_pid_file "$CHROME_PID_FILE"; then
     echo "running"
   else
     echo "stopped"
@@ -83,8 +110,11 @@ case "${1:-}" in
   reset-profile)
     reset_profile
     ;;
+  health)
+    wait_for_cdp
+    ;;
   *)
-    echo "usage: browserctl {start|stop|restart|status|reset-profile}" >&2
+    echo "usage: browserctl {start|stop|restart|status|reset-profile|health}" >&2
     exit 1
     ;;
 esac

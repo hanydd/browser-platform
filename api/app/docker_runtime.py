@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
+import logging
+import socket
+from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
 import docker
@@ -9,6 +11,8 @@ from docker.errors import NotFound
 
 from .config import Settings
 from .models import PoolContainerRecord, utcnow
+
+logger = logging.getLogger(__name__)
 
 
 class DockerRuntime:
@@ -51,6 +55,7 @@ class DockerRuntime:
             tmpfs={
                 "/tmp": "exec,size=1536m",
                 "/var/run": "size=16m",
+                "/var/log": "size=16m",
                 "/root": "size=128m",
             },
             cap_drop=["ALL"],
@@ -105,21 +110,24 @@ class DockerRuntime:
         output = result.output.decode("utf-8", errors="ignore") if result.output else ""
         return result.exit_code, output
 
+    async def browserctl(self, container_name: str, *args: str) -> tuple[int, str]:
+        return await self.exec(container_name, ["/usr/local/bin/browserctl", *args])
+
     async def start_browser(self, container_name: str) -> None:
-        code, output = await self.exec(container_name, ["/usr/local/bin/browserctl", "start"])
+        code, output = await self.browserctl(container_name, "start")
         if code != 0:
             raise RuntimeError(f"failed to start browser in {container_name}: {output}")
 
     async def stop_browser(self, container_name: str) -> None:
-        await self.exec(container_name, ["/usr/local/bin/browserctl", "stop"])
+        await self.browserctl(container_name, "stop")
 
     async def reset_profile(self, container_name: str) -> None:
-        code, output = await self.exec(container_name, ["/usr/local/bin/browserctl", "reset-profile"])
+        code, output = await self.browserctl(container_name, "reset-profile")
         if code != 0:
             raise RuntimeError(f"failed to reset profile in {container_name}: {output}")
 
     async def browser_status(self, container_name: str) -> str:
-        _, output = await self.exec(container_name, ["/usr/local/bin/browserctl", "status"])
+        _, output = await self.browserctl(container_name, "status")
         return output.strip()
 
     async def save_profile(self, container_name: str, archive_path: Path) -> None:
@@ -141,6 +149,31 @@ class DockerRuntime:
     def _restore_profile_sync(self, container_name: str, archive_path: Path) -> None:
         container = self.client.containers.get(container_name)
         data = archive_path.read_bytes()
-        ok = container.put_archive("/tmp", data)
-        if not ok:
+        target_dir = str(PurePosixPath(self.settings.browser_profile_dir).parent)
+        exec_id = self.client.api.exec_create(
+            container.id,
+            ["tar", "-xf", "-", "-C", target_dir],
+            stdin=True,
+        )["Id"]
+        exec_socket = self.client.api.exec_start(exec_id, socket=True)
+        raw_socket = getattr(exec_socket, "_sock", exec_socket)
+        try:
+            raw_socket.sendall(data)
+            raw_socket.shutdown(socket.SHUT_WR)
+            while raw_socket.recv(4096):
+                pass
+        finally:
+            exec_socket.close()
+
+        result = self.client.api.exec_inspect(exec_id)
+        if result["ExitCode"] != 0:
+            logger.error(
+                "restore_profile_failed",
+                extra={
+                    "container_name": container_name,
+                    "archive_path": str(archive_path),
+                    "target_dir": target_dir,
+                    "exit_code": result["ExitCode"],
+                },
+            )
             raise RuntimeError(f"failed to restore profile archive for {container_name}")

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import hmac
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -21,6 +23,7 @@ from .service import SessionService
 from .store import RedisStore
 
 logger = logging.getLogger(__name__)
+VNC_AUTH_COOKIE = "browser_vnc_auth"
 SESSION_CREATE_COUNTER = Counter("browser_platform_sessions_created_total", "Total created browser sessions")
 SESSION_DELETE_COUNTER = Counter("browser_platform_sessions_deleted_total", "Total deleted browser sessions")
 ACTIVE_SESSIONS_GAUGE = Gauge("browser_platform_active_sessions", "Active browser sessions")
@@ -57,6 +60,54 @@ async def authorize_websocket(websocket: WebSocket) -> None:
     if token != settings.api_key:
         await websocket.close(code=4401, reason="invalid api key")
         raise RuntimeError("unauthorized websocket")
+
+
+def make_vnc_cookie_value(secret: str, session_id: str) -> str:
+    digest = hmac.new(secret.encode("utf-8"), session_id.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{session_id}:{digest}"
+
+
+def has_valid_vnc_cookie(cookie_value: str | None, secret: str, session_id: str) -> bool:
+    if not cookie_value:
+        return False
+    expected = make_vnc_cookie_value(secret, session_id)
+    return hmac.compare_digest(cookie_value, expected)
+
+
+async def authorize_vnc_request(request: Request, session_id: str) -> bool:
+    settings = request.app.state.settings
+    token = extract_api_key(request.headers, request.query_params)
+    if token == settings.api_key:
+        return True
+    if has_valid_vnc_cookie(request.cookies.get(VNC_AUTH_COOKIE), settings.api_key, session_id):
+        return False
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid api key")
+
+
+async def authorize_vnc_websocket(websocket: WebSocket, session_id: str) -> bool:
+    settings = websocket.app.state.settings
+    token = extract_api_key(websocket.headers, websocket.query_params)
+    if token == settings.api_key:
+        return True
+    if has_valid_vnc_cookie(websocket.cookies.get(VNC_AUTH_COOKIE), settings.api_key, session_id):
+        return False
+    await websocket.close(code=4401, reason="invalid api key")
+    raise RuntimeError("unauthorized websocket")
+
+
+def maybe_set_vnc_cookie(response: Response, request: Request, session_id: str, authenticated_by_token: bool) -> None:
+    if not authenticated_by_token:
+        return
+    settings = request.app.state.settings
+    response.set_cookie(
+        key=VNC_AUTH_COOKIE,
+        value=make_vnc_cookie_value(settings.api_key, session_id),
+        max_age=settings.default_ttl_seconds,
+        httponly=True,
+        samesite="lax",
+        secure=request.url.scheme == "https",
+        path=f"/sessions/{session_id}/vnc",
+    )
 
 
 async def housekeeping_loop(app: FastAPI) -> None:
@@ -202,8 +253,9 @@ def _build_target_url(container_ip: str, port: int, path: str, query_params) -> 
     return target
 
 
-async def _proxy_http(request: Request, session_id: str, path: str, port: int) -> Response:
-    await authorize_request(request)
+async def _proxy_http(request: Request, session_id: str, path: str, port: int, *, enforce_auth: bool = True) -> Response:
+    if enforce_auth:
+        await authorize_request(request)
     session = await request.app.state.store.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="session not found")
@@ -220,7 +272,7 @@ async def _proxy_http(request: Request, session_id: str, path: str, port: int) -
     filtered_headers = {
         k: v
         for k, v in response.headers.items()
-        if k.lower() not in {"content-encoding", "transfer-encoding", "connection"}
+        if k.lower() not in {"content-encoding", "transfer-encoding", "connection", "content-length"}
     }
     content = response.content
     if port == 9222 and response.headers.get("content-type", "").startswith("application/json"):
@@ -257,7 +309,10 @@ async def proxy_cdp_http(session_id: str, request: Request, path: str = ""):
 @app.api_route("/sessions/{session_id}/vnc", methods=["GET", "POST", "OPTIONS"])
 @app.api_route("/sessions/{session_id}/vnc/{path:path}", methods=["GET", "POST", "OPTIONS"])
 async def proxy_vnc_http(session_id: str, request: Request, path: str = ""):
-    return await _proxy_http(request, session_id, path, 6080)
+    authenticated_by_token = await authorize_vnc_request(request, session_id)
+    response = await _proxy_http(request, session_id, path, 6080, enforce_auth=False)
+    maybe_set_vnc_cookie(response, request, session_id, authenticated_by_token)
+    return response
 
 
 async def _pump_ws_client_to_remote(client_ws: WebSocket, remote_ws) -> None:
@@ -280,7 +335,10 @@ async def _pump_ws_remote_to_client(client_ws: WebSocket, remote_ws) -> None:
 
 
 async def _proxy_ws(websocket: WebSocket, session_id: str, path: str, port: int) -> None:
-    await authorize_websocket(websocket)
+    if port == 6080:
+        await authorize_vnc_websocket(websocket, session_id)
+    else:
+        await authorize_websocket(websocket)
     session = await websocket.app.state.store.get_session(session_id)
     if not session:
         await websocket.close(code=4404, reason="session not found")

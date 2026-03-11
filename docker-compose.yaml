@@ -15,6 +15,8 @@ services:
       - redis-data:/data
     networks:
       - browser-platform
+    ports:
+      - "6380:6379"
     mem_limit: 512m
     security_opt:
       - no-new-privileges:true
@@ -51,9 +53,14 @@ services:
       PROFILE_ARCHIVE_DIR: /data/profiles
       LOG_LEVEL: INFO
       LOG_JSON: "true"
+      HOME: /tmp
+      UV_CACHE_DIR: /tmp/.uv-cache
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - profile-archives:/data/profiles
+      - ./api/app:/app/app:ro
+    ports:
+      - "8000:8000"
     networks:
       - browser-platform
     mem_limit: 1g

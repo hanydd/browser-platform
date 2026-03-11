@@ -80,7 +80,7 @@ class SessionService:
     async def create_session(self, payload: SessionCreateRequest, base_url: str) -> SessionResponse:
         existing = await self.store.get_user_session(payload.user_id)
         if existing:
-            if existing.expires_at <= utcnow():
+            if existing.expires_at <= utcnow() or existing.status != "running":
                 await self._release_session(existing)
             else:
                 raise ValueError(f"user {payload.user_id} already has an active session")
@@ -176,10 +176,31 @@ class SessionService:
         session.status = "releasing"
         await self.store.save_session(session)
 
-        await self.runtime.stop_browser(session.container_name)
-        if session.persist_profile:
-            await self.runtime.save_profile(session.container_name, self.profile_archive_path(session.user_id))
-        await self.runtime.reset_profile(session.container_name)
+        cleanup_failed = False
+        try:
+            await self.runtime.stop_browser(session.container_name)
+            if session.persist_profile:
+                await self.runtime.save_profile(session.container_name, self.profile_archive_path(session.user_id))
+            await self.runtime.reset_profile(session.container_name)
+        except Exception:
+            cleanup_failed = True
+            logger.exception(
+                "session_release_cleanup_failed",
+                extra={"session_id": session.session_id, "container_name": session.container_name},
+            )
+
+        await self.store.delete_session(session.session_id, session.user_id)
+
+        if cleanup_failed:
+            try:
+                await self.runtime.remove_container(session.container_name)
+            except Exception:
+                logger.exception(
+                    "session_release_remove_container_failed",
+                    extra={"session_id": session.session_id, "container_name": session.container_name},
+                )
+            await self.store.delete_pool_container(session.container_name)
+            return
 
         item = await self.store.get_pool_container(session.container_name)
         if not item:
@@ -189,7 +210,6 @@ class SessionService:
                 status="draining",
                 created_at=session.created_at,
             )
-        await self.store.delete_session(session.session_id, session.user_id)
         await self.release_pool_container(item)
 
     async def wait_for_browser(self, container_name: str) -> tuple[str, str]:
@@ -214,14 +234,16 @@ class SessionService:
         prefix = f"{base_url.rstrip('/')}/sessions/{session.session_id}"
         token = self.settings.api_key
         query_join = "&" if "?" in session.browser_ws_path else "?"
+        ws_prefix = prefix.replace("http://", "ws://").replace("https://", "wss://")
+        vnc_ws_path = f"sessions/{session.session_id}/vnc/websockify"
         return SessionResponse(
             session_id=session.session_id,
             user_id=session.user_id,
             status=session.status,
             created_at=session.created_at,
             expires_at=session.expires_at,
-            cdp_url=f"{prefix}/cdp{session.browser_ws_path}{query_join}token={token}",
+            cdp_url=f"{ws_prefix}/cdp{session.browser_ws_path}{query_join}token={token}",
             cdp_http_url=f"{prefix}/cdp?token={token}",
             vnc_url=f"{prefix}/vnc/?token={token}",
-            viewer_url=f"{prefix}/vnc/vnc.html?autoconnect=true&resize=scale&token={token}",
+            viewer_url=f"{prefix}/vnc/vnc.html?autoconnect=true&resize=scale&path={vnc_ws_path}&token={token}",
         )
