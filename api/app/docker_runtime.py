@@ -10,7 +10,6 @@ import docker
 from docker.errors import NotFound
 
 from .config import Settings
-from .models import PoolContainerRecord, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -29,14 +28,15 @@ class DockerRuntime:
         except NotFound:
             self.client.networks.create(self.settings.docker_network, driver="bridge")
 
-    async def create_idle_container(self) -> PoolContainerRecord:
-        return await asyncio.to_thread(self._create_idle_container_sync)
+    async def create_container(self) -> tuple[str, str]:
+        """Create a new browser container on demand. Returns (container_id, container_name)."""
+        return await asyncio.to_thread(self._create_container_sync)
 
-    def _create_idle_container_sync(self) -> PoolContainerRecord:
+    def _create_container_sync(self) -> tuple[str, str]:
         suffix = uuid4().hex[:12]
-        name = f"{self.settings.pool_container_prefix}-{suffix}"
+        name = f"{self.settings.browser_container_prefix}-{suffix}"
         labels = {
-            "com.browserplatform.role": "pool",
+            "com.browserplatform.role": "session",
             "com.browserplatform.managed": "true",
         }
         container = self.client.containers.run(
@@ -61,14 +61,9 @@ class DockerRuntime:
             cap_drop=["ALL"],
             security_opt=["no-new-privileges:true"],
             labels=labels,
-            restart_policy={"Name": "unless-stopped"},
+            restart_policy={"Name": "no"},
         )
-        return PoolContainerRecord(
-            container_id=container.id,
-            container_name=name,
-            status="idle",
-            created_at=utcnow(),
-        )
+        return container.id, name
 
     async def get_container(self, container_name: str):
         return await asyncio.to_thread(self.client.containers.get, container_name)
@@ -118,6 +113,22 @@ class DockerRuntime:
         if code != 0:
             raise RuntimeError(f"failed to start browser in {container_name}: {output}")
 
+    async def wait_for_display(self, container_name: str, attempts: int = 20, delay: float = 0.5) -> None:
+        """Wait until Xvfb display is up inside the container.
+
+        We check for an Xvfb process before starting Chromium to avoid
+        'Missing X server or $DISPLAY' errors when the container has just started.
+        """
+        for _ in range(attempts):
+            code, output = await self.exec(
+                container_name,
+                ["sh", "-lc", "ps aux | grep '[X]vfb' || true"],
+            )
+            if code == 0 and "Xvfb" in output:
+                return
+            await asyncio.sleep(delay)
+        raise RuntimeError(f"display server in {container_name} did not become ready in time")
+
     async def stop_browser(self, container_name: str) -> None:
         await self.browserctl(container_name, "stop")
 
@@ -125,6 +136,24 @@ class DockerRuntime:
         code, output = await self.browserctl(container_name, "reset-profile")
         if code != 0:
             raise RuntimeError(f"failed to reset profile in {container_name}: {output}")
+
+    async def cleanup_profile_locks(self, container_name: str) -> None:
+        """Remove Chromium profile lock files after restoring a profile.
+
+        When we reuse a saved user profile in a *new* container, Chromium may
+        see old lock files (Singleton*) and refuse to start, thinking the
+        profile is in use on another machine. We can safely delete these.
+        """
+        cmd = [
+            "sh",
+            "-lc",
+            (
+                f'cd "{self.settings.browser_profile_dir}" 2>/dev/null || exit 0; '
+                "rm -f Singleton* lockfile *.lock 2>/dev/null || true"
+            ),
+        ]
+        # We don't care about exit code here; best-effort cleanup.
+        await self.exec(container_name, cmd)
 
     async def browser_status(self, container_name: str) -> str:
         _, output = await self.browserctl(container_name, "status")

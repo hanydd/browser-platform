@@ -28,7 +28,6 @@ class SessionRecord(BaseModel):
     status: Literal["starting", "running", "expired", "releasing"]
     persist_profile: bool = True
     metadata: dict[str, Any] = Field(default_factory=dict)
-    assigned_from_pool: bool = True
     created_at: datetime
     expires_at: datetime
     last_used_at: datetime
@@ -45,7 +44,6 @@ class SessionRecord(BaseModel):
         ttl_seconds: int,
         persist_profile: bool,
         metadata: dict[str, Any],
-        assigned_from_pool: bool,
     ) -> "SessionRecord":
         now = utcnow()
         return cls(
@@ -58,7 +56,6 @@ class SessionRecord(BaseModel):
             status="starting",
             persist_profile=persist_profile,
             metadata=metadata,
-            assigned_from_pool=assigned_from_pool,
             created_at=now,
             expires_at=now + timedelta(seconds=ttl_seconds),
             last_used_at=now,
@@ -80,19 +77,6 @@ class SessionResponse(BaseModel):
 class KeepAliveResponse(BaseModel):
     session_id: str
     expires_at: datetime
-
-
-class PoolContainerRecord(BaseModel):
-    container_id: str
-    container_name: str
-    status: Literal["idle", "assigned", "draining"]
-    created_at: datetime
-
-
-class PoolStats(BaseModel):
-    idle: int
-    total: int
-    max_size: int
 
 
 class HealthResponse(BaseModel):

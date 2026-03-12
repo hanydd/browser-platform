@@ -10,7 +10,7 @@ import httpx
 
 from .config import Settings
 from .docker_runtime import DockerRuntime
-from .models import KeepAliveResponse, PoolContainerRecord, PoolStats, SessionCreateRequest, SessionRecord, SessionResponse, utcnow
+from .models import KeepAliveResponse, SessionCreateRequest, SessionRecord, SessionResponse, utcnow
 from .store import RedisStore
 
 logger = logging.getLogger(__name__)
@@ -30,52 +30,6 @@ class SessionService:
     async def startup(self) -> None:
         await self.runtime.ensure_network()
         await self.reconcile_state()
-        await self.refill_pool()
-
-    async def refill_pool(self) -> None:
-        async with self._lock:
-            idle = await self.store.idle_pool_count()
-            total = await self.store.total_pool_count()
-            while idle < self.settings.pool_min_size and total < self.settings.pool_max_size:
-                item = await self.runtime.create_idle_container()
-                await self.store.save_pool_container(item)
-                await self.store.mark_pool_idle(item.container_name)
-                idle += 1
-                total += 1
-
-    async def acquire_pool_container(self) -> PoolContainerRecord:
-        async with self._lock:
-            while True:
-                container_name = await self.store.pop_idle_pool_container()
-                if container_name:
-                    item = await self.store.get_pool_container(container_name)
-                    if item:
-                        item.status = "assigned"
-                        await self.store.save_pool_container(item)
-                        return item
-                    await self.store.delete_pool_container(container_name)
-                    continue
-
-                total = await self.store.total_pool_count()
-                if total >= self.settings.pool_max_size:
-                    raise RuntimeError("warm pool exhausted")
-
-                item = await self.runtime.create_idle_container()
-                item.status = "assigned"
-                await self.store.save_pool_container(item)
-                return item
-
-    async def release_pool_container(self, item: PoolContainerRecord) -> None:
-        async with self._lock:
-            total = await self.store.total_pool_count()
-            if total > self.settings.pool_max_size:
-                await self.runtime.remove_container(item.container_name)
-                await self.store.delete_pool_container(item.container_name)
-                return
-
-            item.status = "idle"
-            await self.store.save_pool_container(item)
-            await self.store.mark_pool_idle(item.container_name)
 
     async def create_session(self, payload: SessionCreateRequest, base_url: str) -> SessionResponse:
         existing = await self.store.get_user_session(payload.user_id)
@@ -86,33 +40,37 @@ class SessionService:
                 raise ValueError(f"user {payload.user_id} already has an active session")
 
         ttl_seconds = payload.ttl_seconds or self.settings.default_ttl_seconds
-        pool_item = await self.acquire_pool_container()
+        container_id, container_name = await self.runtime.create_container()
 
         try:
-            await self.runtime.stop_browser(pool_item.container_name)
-            await self.runtime.reset_profile(pool_item.container_name)
+            # Wait until Xvfb is up before starting Chromium, otherwise
+            # we may see 'Missing X server or $DISPLAY' and CDP never comes up.
+            await self.runtime.wait_for_display(container_name)
             if payload.persist_profile:
                 await self.runtime.restore_profile(
-                    pool_item.container_name,
+                    container_name,
                     self.profile_archive_path(payload.user_id),
                 )
-            await self.runtime.start_browser(pool_item.container_name)
-            container_ip, browser_ws_path = await self.wait_for_browser(pool_item.container_name)
+                # Clear any stale Chromium lock files from the restored profile.
+                await self.runtime.cleanup_profile_locks(container_name)
+            await self.runtime.start_browser(container_name)
+            container_ip, browser_ws_path = await self.wait_for_browser(container_name)
         except Exception:
-            await self.runtime.remove_container(pool_item.container_name)
-            await self.store.delete_pool_container(pool_item.container_name)
+            try:
+                await self.runtime.remove_container(container_name)
+            except Exception:
+                logger.exception("create_session_cleanup_failed", extra={"container_name": container_name})
             raise
 
         session = SessionRecord.create(
             user_id=payload.user_id,
-            container_id=pool_item.container_id,
-            container_name=pool_item.container_name,
+            container_id=container_id,
+            container_name=container_name,
             container_ip=container_ip,
             browser_ws_path=browser_ws_path,
             ttl_seconds=ttl_seconds,
             persist_profile=payload.persist_profile,
             metadata=payload.metadata,
-            assigned_from_pool=True,
         )
         session.status = "running"
         await self.store.save_session(session)
@@ -143,13 +101,6 @@ class SessionService:
         sessions = await self.store.list_sessions()
         return [self.to_response(session, base_url) for session in sessions]
 
-    async def pool_stats(self) -> PoolStats:
-        return PoolStats(
-            idle=await self.store.idle_pool_count(),
-            total=await self.store.total_pool_count(),
-            max_size=self.settings.pool_max_size,
-        )
-
     async def housekeeping_once(self) -> None:
         await self.reconcile_state()
         sessions = await self.store.list_sessions()
@@ -157,19 +108,15 @@ class SessionService:
         for session in sessions:
             if session.expires_at <= now:
                 await self._release_session(session)
-        await self.refill_pool()
 
     async def reconcile_state(self) -> None:
-        pool_items = await self.store.list_pool_containers()
-        for item in pool_items:
-            if not await self.runtime.container_exists(item.container_name):
-                logger.warning("pool container missing, pruning state", extra={"container_name": item.container_name})
-                await self.store.delete_pool_container(item.container_name)
-
         sessions = await self.store.list_sessions()
         for session in sessions:
             if not await self.runtime.container_exists(session.container_name):
-                logger.warning("session container missing, deleting session record", extra={"session_id": session.session_id})
+                logger.warning(
+                    "session container missing, deleting session record",
+                    extra={"session_id": session.session_id},
+                )
                 await self.store.delete_session(session.session_id, session.user_id)
 
     async def _release_session(self, session: SessionRecord) -> None:
@@ -177,10 +124,16 @@ class SessionService:
         await self.store.save_session(session)
         archive_path = self.profile_archive_path(session.user_id)
 
-        cleanup_failed = False
         try:
             await self.runtime.stop_browser(session.container_name)
-            if session.persist_profile:
+        except Exception:
+            logger.exception(
+                "session_stop_browser_failed",
+                extra={"session_id": session.session_id, "container_name": session.container_name},
+            )
+
+        if session.persist_profile:
+            try:
                 logger.info(
                     "session_profile_persist_started",
                     extra={
@@ -202,41 +155,26 @@ class SessionService:
                         "archive_size": archive_path.stat().st_size if archive_path.exists() else 0,
                     },
                 )
-            await self.runtime.reset_profile(session.container_name)
-        except Exception:
-            cleanup_failed = True
-            logger.exception(
-                "session_release_cleanup_failed",
-                extra={
-                    "session_id": session.session_id,
-                    "user_id": session.user_id,
-                    "container_name": session.container_name,
-                    "archive_path": str(archive_path),
-                },
-            )
+            except Exception:
+                logger.exception(
+                    "session_profile_persist_failed",
+                    extra={
+                        "session_id": session.session_id,
+                        "user_id": session.user_id,
+                        "container_name": session.container_name,
+                        "archive_path": str(archive_path),
+                    },
+                )
 
         await self.store.delete_session(session.session_id, session.user_id)
 
-        if cleanup_failed:
-            try:
-                await self.runtime.remove_container(session.container_name)
-            except Exception:
-                logger.exception(
-                    "session_release_remove_container_failed",
-                    extra={"session_id": session.session_id, "container_name": session.container_name},
-                )
-            await self.store.delete_pool_container(session.container_name)
-            return
-
-        item = await self.store.get_pool_container(session.container_name)
-        if not item:
-            item = PoolContainerRecord(
-                container_id=session.container_id,
-                container_name=session.container_name,
-                status="draining",
-                created_at=session.created_at,
+        try:
+            await self.runtime.remove_container(session.container_name)
+        except Exception:
+            logger.exception(
+                "session_release_remove_container_failed",
+                extra={"session_id": session.session_id, "container_name": session.container_name},
             )
-        await self.release_pool_container(item)
 
     async def wait_for_browser(self, container_name: str) -> tuple[str, str]:
         container_ip = await self.runtime.get_container_ip(container_name)

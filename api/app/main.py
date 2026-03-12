@@ -27,7 +27,6 @@ VNC_AUTH_COOKIE = "browser_vnc_auth"
 SESSION_CREATE_COUNTER = Counter("browser_platform_sessions_created_total", "Total created browser sessions")
 SESSION_DELETE_COUNTER = Counter("browser_platform_sessions_deleted_total", "Total deleted browser sessions")
 ACTIVE_SESSIONS_GAUGE = Gauge("browser_platform_active_sessions", "Active browser sessions")
-POOL_IDLE_GAUGE = Gauge("browser_platform_pool_idle", "Idle containers in the warm pool")
 
 
 def build_base_url(request: Request) -> str:
@@ -115,10 +114,8 @@ async def housekeeping_loop(app: FastAPI) -> None:
     while True:
         try:
             await app.state.session_service.housekeeping_once()
-            pool = await app.state.session_service.pool_stats()
             sessions = await app.state.store.list_sessions()
             ACTIVE_SESSIONS_GAUGE.set(len(sessions))
-            POOL_IDLE_GAUGE.set(pool.idle)
         except Exception:
             logger.exception("housekeeping_loop_failed")
         await asyncio.sleep(settings.housekeeping_interval_seconds)
@@ -227,12 +224,6 @@ async def keep_alive(session_id: str, request: Request):
         return await request.app.state.session_service.keep_alive(session_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="session not found") from exc
-
-
-@app.get("/api/pool")
-async def pool_stats(request: Request):
-    await authorize_request(request)
-    return await request.app.state.session_service.pool_stats()
 
 
 async def _get_target(request: Request, session_id: str) -> tuple[str, str]:
